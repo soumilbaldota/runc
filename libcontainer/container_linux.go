@@ -45,6 +45,30 @@ type Container struct {
 	fifo                 *os.File
 }
 
+func (c *Container) Freeze() error {
+	err := c.cgroupManager.Freeze(cgroups.Frozen)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *Container) Thaw() error {
+	err := c.cgroupManager.Freeze(cgroups.Thawed)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *Container) Apply(pid int) error {
+	err := c.cgroupManager.Apply(pid)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
 // State represents a running container's state
 type State struct {
 	BaseState

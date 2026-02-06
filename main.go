@@ -144,6 +144,7 @@ func main() {
 		stateCommand,
 		updateCommand,
 		featuresCommand,
+		superforkCommand,
 	}
 	app.Before = func(context *cli.Context) error {
 		if !context.IsSet("root") && xdgDirUsed {
