@@ -123,7 +123,6 @@ func cgroupPathForKernel(absolutePath string) string {
 	return absolutePath
 }
 
-// doSuperFork implements the container cloning workflow
 func doSuperFork(context *cli.Context) error {
 	sourceID := context.Args().Get(0)
 	newID := context.Args().Get(1)
@@ -132,6 +131,7 @@ func doSuperFork(context *cli.Context) error {
 		return errors.New("root not set")
 	}
 
+	// Load and freeze source
 	sourceContainer, err := libcontainer.Load(root, sourceID)
 	if err != nil {
 		return fmt.Errorf("failed to load source container: %w", err)
@@ -150,7 +150,6 @@ func doSuperFork(context *cli.Context) error {
 		return fmt.Errorf("failed to freeze source: %w", err)
 	}
 
-	// Track if we successfully thawed the source
 	sourceThawed := false
 	thawSource := func() {
 		if sourceThawed {
@@ -175,7 +174,7 @@ func doSuperFork(context *cli.Context) error {
 	}
 	defer thawSource()
 
-	// Step 3: Get source PIDs
+	// Get source PIDs
 	pids, err := sourceContainer.Processes()
 	if err != nil {
 		return err
@@ -183,28 +182,50 @@ func doSuperFork(context *cli.Context) error {
 	if len(pids) == 0 {
 		return fmt.Errorf("no processes in source container")
 	}
+
+	// Prepare new container
 	_, spec, err := prepareNewContainer(context, sourceID, newID)
 	if err != nil {
 		return err
 	}
+
+	// Create new container
 	newContainer, err := createContainer(context, newID, spec)
 	if err != nil {
 		return err
 	}
+
+	// Apply cgroup setup
 	if err := newContainer.Apply(-1); err != nil {
 		newContainer.Destroy()
 		return err
 	}
+
+	// Get NEW container's cgroup path
 	cgroupPath, err := getContainerCgroupPath(newContainer)
 	if err != nil {
 		newContainer.Destroy()
-		return err
+		return fmt.Errorf("failed to get new container cgroup path: %w", err)
 	}
+
+	// Verify cgroup exists
 	if _, err := os.Stat(cgroupPath); err != nil {
 		newContainer.Destroy()
-		return err
+		return fmt.Errorf("new container cgroup doesn't exist at %s: %w", cgroupPath, err)
 	}
+
+	// Convert to kernel-relative path
 	kernelCgroupPath := cgroupPathForKernel(cgroupPath)
+
+	// CRITICAL: Verify we have a valid path
+	if kernelCgroupPath == "" || kernelCgroupPath == "/" {
+		newContainer.Destroy()
+		return fmt.Errorf("invalid kernel cgroup path: %s", kernelCgroupPath)
+	}
+
+	logrus.Infof("superfork: using cgroup path: %s (kernel: %s)", cgroupPath, kernelCgroupPath)
+
+	// Call superfork syscall
 	newInitPID, err := superforkSyscall(pids, newID, kernelCgroupPath)
 	if err != nil {
 		newContainer.Destroy()
