@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/opencontainers/runtime-spec/specs-go"
@@ -35,9 +36,32 @@ type ContainerConfig struct {
 	CgroupNsPath    [256]byte
 	OwnerUID        uint32
 	OwnerGID        uint32
-	ShareNamespaces uint8 // unused for now.
+	ShareNamespaces uint8
 	_               [3]byte
 }
+
+// ========== Performance Tracking ==========
+
+type perfTimer struct {
+	name  string
+	start time.Time
+}
+
+func startTimer(name string) *perfTimer {
+	return &perfTimer{name: name, start: time.Now()}
+}
+
+func (t *perfTimer) Stop() {
+	elapsed := time.Since(t.start)
+	logrus.Infof("[PERF] %s: %v", t.name, elapsed)
+}
+
+func (t *perfTimer) Checkpoint(stage string) {
+	elapsed := time.Since(t.start)
+	logrus.Infof("[PERF] %s.%s: %v", t.name, stage, elapsed)
+}
+
+// ========== End Performance Tracking ==========
 
 var superforkCommand = cli.Command{
 	Name:  "superfork",
@@ -99,9 +123,7 @@ func superforkCreatePidFile(path string, pid int) error {
 	return os.Rename(tmpName, path)
 }
 
-// cgroupPathForKernel converts an absolute cgroup path to a kernel-relative path
 func cgroupPathForKernel(absolutePath string) string {
-	// Strip common prefixes
 	prefixes := []string{
 		"/sys/fs/cgroup/",
 		"/sys/fs/cgroup",
@@ -110,7 +132,6 @@ func cgroupPathForKernel(absolutePath string) string {
 	for _, prefix := range prefixes {
 		if strings.HasPrefix(absolutePath, prefix) {
 			relativePath := strings.TrimPrefix(absolutePath, prefix)
-			// Ensure we have a leading slash for the relative path
 			if relativePath != "" && !strings.HasPrefix(relativePath, "/") {
 				relativePath = "/" + relativePath
 			}
@@ -119,11 +140,13 @@ func cgroupPathForKernel(absolutePath string) string {
 		}
 	}
 
-	// If no prefix matched, return as-is (might already be relative)
 	return absolutePath
 }
 
 func doSuperFork(context *cli.Context) error {
+	timer := startTimer("total")
+	defer timer.Stop()
+
 	sourceID := context.Args().Get(0)
 	newID := context.Args().Get(1)
 	root := context.GlobalString("root")
@@ -131,11 +154,13 @@ func doSuperFork(context *cli.Context) error {
 		return errors.New("root not set")
 	}
 
-	// Load and freeze source
+	// Load source container
+	t1 := startTimer("load_source")
 	sourceContainer, err := libcontainer.Load(root, sourceID)
 	if err != nil {
 		return fmt.Errorf("failed to load source container: %w", err)
 	}
+	t1.Stop()
 
 	status, err := sourceContainer.Status()
 	if err != nil {
@@ -146,15 +171,22 @@ func doSuperFork(context *cli.Context) error {
 		return fmt.Errorf("source container must be running (current: %v)", status)
 	}
 
+	// Freeze source
+	t2 := startTimer("freeze_source")
 	if err := sourceContainer.Pause(); err != nil {
 		return fmt.Errorf("failed to freeze source: %w", err)
 	}
+	t2.Stop()
+	timer.Checkpoint("source_frozen")
 
 	sourceThawed := false
 	thawSource := func() {
 		if sourceThawed {
 			return
 		}
+		t := startTimer("thaw_source")
+		defer t.Stop()
+
 		logrus.Info("superfork: thawing source container")
 		currentStatus, err := sourceContainer.Status()
 		if err != nil {
@@ -182,42 +214,47 @@ func doSuperFork(context *cli.Context) error {
 	if len(pids) == 0 {
 		return fmt.Errorf("no processes in source container")
 	}
+	timer.Checkpoint("got_pids")
 
 	// Prepare new container
+	t3 := startTimer("prepare_new_container")
 	_, spec, err := prepareNewContainer(context, sourceID, newID)
 	if err != nil {
 		return err
 	}
+	t3.Stop()
 
 	// Create new container
+	t4 := startTimer("create_container")
 	newContainer, err := createContainer(context, newID, spec)
 	if err != nil {
 		return err
 	}
+	t4.Stop()
 
 	// Apply cgroup setup
+	t5 := startTimer("apply_cgroup")
 	if err := newContainer.Apply(-1); err != nil {
 		newContainer.Destroy()
 		return err
 	}
+	t5.Stop()
+	timer.Checkpoint("cgroup_applied")
 
-	// Get NEW container's cgroup path
+	// Get cgroup path
 	cgroupPath, err := getContainerCgroupPath(newContainer)
 	if err != nil {
 		newContainer.Destroy()
 		return fmt.Errorf("failed to get new container cgroup path: %w", err)
 	}
 
-	// Verify cgroup exists
 	if _, err := os.Stat(cgroupPath); err != nil {
 		newContainer.Destroy()
 		return fmt.Errorf("new container cgroup doesn't exist at %s: %w", cgroupPath, err)
 	}
 
-	// Convert to kernel-relative path
 	kernelCgroupPath := cgroupPathForKernel(cgroupPath)
 
-	// CRITICAL: Verify we have a valid path
 	if kernelCgroupPath == "" || kernelCgroupPath == "/" {
 		newContainer.Destroy()
 		return fmt.Errorf("invalid kernel cgroup path: %s", kernelCgroupPath)
@@ -226,7 +263,11 @@ func doSuperFork(context *cli.Context) error {
 	logrus.Infof("superfork: using cgroup path: %s (kernel: %s)", cgroupPath, kernelCgroupPath)
 
 	// Call superfork syscall
+	t6 := startTimer("superfork_syscall")
 	newInitPID, err := superforkSyscall(pids, newID, kernelCgroupPath)
+	t6.Stop()
+	timer.Checkpoint("syscall_done")
+
 	if err != nil {
 		newContainer.Destroy()
 		return fmt.Errorf("syscall failed: %w", err)
@@ -234,9 +275,12 @@ func doSuperFork(context *cli.Context) error {
 
 	logrus.Infof("superfork: new init PID: %d", newInitPID)
 
+	// Update state
+	t7 := startTimer("update_state")
 	if err := updateContainerState(context, newContainer, int(newInitPID), root, newID); err != nil {
 		logrus.Errorf("failed to update container state: %v", err)
 	}
+	t7.Stop()
 
 	if pidFile := context.String("pid-file"); pidFile != "" {
 		if err := superforkCreatePidFile(pidFile, int(newInitPID)); err != nil {
@@ -245,6 +289,7 @@ func doSuperFork(context *cli.Context) error {
 	}
 
 	thawSource()
+	timer.Checkpoint("source_thawed")
 
 	if context.Bool("detach") {
 		fmt.Printf("Container %s successfully forked to %s (init PID: %d)\n",
@@ -338,7 +383,6 @@ func prepareNewContainer(context *cli.Context, sourceID, newID string) (
 	*specs.Spec,
 	error,
 ) {
-
 	bundle := context.String("bundle")
 	if bundle == "" {
 		var err error
@@ -393,19 +437,16 @@ func getContainerCgroupPath(container *libcontainer.Container) (string, error) {
 
 	config := container.Config()
 	if config.Cgroups != nil && config.Cgroups.Path != "" {
-		// Try cgroup v2
 		cgroupPath := filepath.Join("/sys/fs/cgroup", config.Cgroups.Path)
 		if _, err := os.Stat(cgroupPath); err == nil {
 			return cgroupPath, nil
 		}
 
-		// Try cgroup v1 (cpu controller)
 		cgroupPath = filepath.Join("/sys/fs/cgroup/cpu", config.Cgroups.Path)
 		if _, err := os.Stat(cgroupPath); err == nil {
 			return cgroupPath, nil
 		}
 
-		// Try cgroup v1 (systemd)
 		cgroupPath = filepath.Join("/sys/fs/cgroup/systemd", config.Cgroups.Path)
 		if _, err := os.Stat(cgroupPath); err == nil {
 			return cgroupPath, nil
