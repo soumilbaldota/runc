@@ -23,10 +23,19 @@ import (
 const (
 	SYS_SUPERFORK = 470
 )
+const BTRFS_IOC_SNAP_CREATE_V2 = 0x50009417
 
+type BtrfsIoctlVolArgsV2 struct {
+	Fd      int64
+	Transid uint64
+	Flags   uint64
+	Unused  [4]uint64
+	Name    [256]byte
+}
 type ContainerConfig struct {
 	ContainerID     [64]byte
 	CgroupPath      [256]byte
+	NewRootfsPath   [4096]byte
 	PidNsPath       [256]byte
 	MntNsPath       [256]byte
 	IpcNsPath       [256]byte
@@ -154,7 +163,6 @@ func doSuperFork(context *cli.Context) error {
 		return errors.New("root not set")
 	}
 
-	// Load source container
 	t1 := startTimer("load_source")
 	sourceContainer, err := libcontainer.Load(root, sourceID)
 	if err != nil {
@@ -170,6 +178,34 @@ func doSuperFork(context *cli.Context) error {
 	if status != libcontainer.Running {
 		return fmt.Errorf("source container must be running (current: %v)", status)
 	}
+
+	sourceConfig := sourceContainer.Config()
+	srcRootfs := sourceConfig.Rootfs
+	if srcRootfs == "" {
+		return fmt.Errorf("source container has no rootfs")
+	}
+
+	srcBundle := filepath.Dir(srcRootfs)
+
+	bundle := context.String("bundle")
+	if bundle == "" {
+		bundleParent := filepath.Dir(srcBundle)
+		bundle = filepath.Join(bundleParent, filepath.Base(srcBundle)+"-"+newID)
+	}
+
+	dstRootfs := filepath.Join(bundle, "rootfs")
+
+	logrus.Infof("superfork: source bundle: %s", srcBundle)
+	logrus.Infof("superfork: new bundle: %s", bundle)
+	logrus.Infof("superfork: source rootfs: %s", srcRootfs)
+	logrus.Infof("superfork: new rootfs: %s", dstRootfs)
+
+	tSnapshot := startTimer("create_snapshot")
+	if err := createBtrfsSnapshot(srcBundle, bundle); err != nil {
+		return fmt.Errorf("failed to create snapshot: %w", err)
+	}
+	tSnapshot.Stop()
+	timer.Checkpoint("snapshot_created")
 
 	// Freeze source
 	t2 := startTimer("freeze_source")
@@ -216,7 +252,7 @@ func doSuperFork(context *cli.Context) error {
 	}
 	timer.Checkpoint("got_pids")
 
-	// Prepare new container
+	// Prepare new container spec
 	t3 := startTimer("prepare_new_container")
 	_, spec, err := prepareNewContainer(context, sourceID, newID)
 	if err != nil {
@@ -261,10 +297,11 @@ func doSuperFork(context *cli.Context) error {
 	}
 
 	logrus.Infof("superfork: using cgroup path: %s (kernel: %s)", cgroupPath, kernelCgroupPath)
+	logrus.Infof("superfork: new rootfs path: %s", dstRootfs)
 
-	// Call superfork syscall
+	// Call superfork syscall with new rootfs path
 	t6 := startTimer("superfork_syscall")
-	newInitPID, err := superforkSyscall(pids, newID, kernelCgroupPath)
+	newInitPID, err := superforkSyscall(pids, newID, kernelCgroupPath, dstRootfs)
 	t6.Stop()
 	timer.Checkpoint("syscall_done")
 
@@ -300,11 +337,79 @@ func doSuperFork(context *cli.Context) error {
 	fmt.Printf("\nContainer %s successfully forked to %s\n", sourceID, newID)
 	fmt.Printf("New container PID: %d\n", newInitPID)
 	fmt.Printf("Cgroup: %s\n", cgroupPath)
+	fmt.Printf("Rootfs: %s\n", dstRootfs)
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	<-sigChan
 	return nil
+}
+
+func createBtrfsSnapshot(src, dst string) error {
+	parent := filepath.Dir(dst)
+	name := filepath.Base(dst)
+
+	logrus.Infof("creating btrfs snapshot: %s -> %s", src, dst)
+
+	// Open source subvolume
+	srcFd, err := syscall.Open(src, syscall.O_RDONLY, 0)
+	if err != nil {
+		return fmt.Errorf("open src: %w", err)
+	}
+	defer syscall.Close(srcFd)
+
+	// Open destination parent directory
+	parentFd, err := syscall.Open(parent, syscall.O_RDONLY, 0)
+	if err != nil {
+		return fmt.Errorf("open parent: %w", err)
+	}
+	defer syscall.Close(parentFd)
+
+	var args BtrfsIoctlVolArgsV2
+	args.Fd = int64(srcFd)
+	copy(args.Name[:], name)
+
+	_, _, errno := syscall.Syscall(
+		syscall.SYS_IOCTL,
+		uintptr(parentFd),
+		uintptr(BTRFS_IOC_SNAP_CREATE_V2),
+		uintptr(unsafe.Pointer(&args)),
+	)
+	if errno != 0 {
+		return fmt.Errorf("btrfs snapshot failed: %v", errno)
+	}
+
+	logrus.Infof("snapshot created: %s", dst)
+	return nil
+}
+
+func superforkSyscall(pids []int, containerID, cgroupPath, rootfsPath string) (int32, error) {
+	pidArr := make([]int32, len(pids))
+	for i, p := range pids {
+		pidArr[i] = int32(p)
+	}
+
+	cfg := ContainerConfig{}
+	copy(cfg.ContainerID[:], containerID)
+	copy(cfg.CgroupPath[:], cgroupPath)
+	copy(cfg.NewRootfsPath[:], rootfsPath) // NEW
+
+	var newInitPID int32
+
+	_, _, errno := syscall.Syscall6(
+		SYS_SUPERFORK,
+		uintptr(unsafe.Pointer(&pidArr[0])),
+		uintptr(len(pidArr)),
+		uintptr(unsafe.Pointer(&cfg)),
+		uintptr(unsafe.Pointer(&newInitPID)),
+		0, 0,
+	)
+
+	if errno != 0 {
+		return 0, fmt.Errorf("superfork syscall failed: %v", errno)
+	}
+
+	return newInitPID, nil
 }
 
 func updateContainerState(context *cli.Context, container *libcontainer.Container, initPID int, root, id string) error {
@@ -454,32 +559,4 @@ func getContainerCgroupPath(container *libcontainer.Container) (string, error) {
 	}
 
 	return "", fmt.Errorf("could not determine cgroup path")
-}
-
-func superforkSyscall(pids []int, containerID, cgroupPath string) (int32, error) {
-	pidArr := make([]int32, len(pids))
-	for i, p := range pids {
-		pidArr[i] = int32(p)
-	}
-
-	cfg := ContainerConfig{}
-	copy(cfg.ContainerID[:], containerID)
-	copy(cfg.CgroupPath[:], cgroupPath)
-
-	var newInitPID int32
-
-	_, _, errno := syscall.Syscall6(
-		SYS_SUPERFORK,
-		uintptr(unsafe.Pointer(&pidArr[0])),
-		uintptr(len(pidArr)),
-		uintptr(unsafe.Pointer(&cfg)),
-		uintptr(unsafe.Pointer(&newInitPID)),
-		0, 0,
-	)
-
-	if errno != 0 {
-		return 0, fmt.Errorf("superfork syscall failed: %v", errno)
-	}
-
-	return newInitPID, nil
 }
