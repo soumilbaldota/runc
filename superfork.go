@@ -254,7 +254,7 @@ func doSuperFork(context *cli.Context) error {
 
 	// Prepare new container spec
 	t3 := startTimer("prepare_new_container")
-	_, spec, err := prepareNewContainer(context, sourceID, newID)
+	_, spec, err := prepareNewContainer(context, sourceID, newID, bundle)
 	if err != nil {
 		return err
 	}
@@ -262,7 +262,17 @@ func doSuperFork(context *cli.Context) error {
 
 	// Create new container
 	t4 := startTimer("create_container")
+	origDir, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("getwd before create: %w", err)
+	}
+	if err := os.Chdir(bundle); err != nil {
+		return fmt.Errorf("chdir to new bundle %s: %w", bundle, err)
+	}
 	newContainer, err := createContainer(context, newID, spec)
+	if chdirErr := os.Chdir(origDir); chdirErr != nil {
+		return fmt.Errorf("restore cwd after create: %w", chdirErr)
+	}
 	if err != nil {
 		return err
 	}
@@ -394,6 +404,9 @@ func superforkSyscall(pids []int, containerID, cgroupPath, rootfsPath string) (i
 	copy(cfg.CgroupPath[:], cgroupPath)
 	copy(cfg.NewRootfsPath[:], rootfsPath) // NEW
 
+	// Explicitly request namespace isolation; kernel will fall back if sockets are sanitized
+	cfg.ShareNamespaces = 0
+
 	var newInitPID int32
 
 	_, _, errno := syscall.Syscall6(
@@ -483,20 +496,11 @@ func getProcessStartTime(pid int) int64 {
 	return 0
 }
 
-func prepareNewContainer(context *cli.Context, sourceID, newID string) (
+func prepareNewContainer(context *cli.Context, sourceID, newID, bundle string) (
 	string,
 	*specs.Spec,
 	error,
 ) {
-	bundle := context.String("bundle")
-	if bundle == "" {
-		var err error
-		bundle, err = os.Getwd()
-		if err != nil {
-			return "", nil, err
-		}
-	}
-
 	spec, err := setupSpecFile(filepath.Join(bundle, "config.json"))
 	if err != nil {
 		return "", nil, fmt.Errorf("load spec: %w", err)
