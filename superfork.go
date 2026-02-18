@@ -52,22 +52,144 @@ type ContainerConfig struct {
 // ========== Performance Tracking ==========
 
 type perfTimer struct {
-	name  string
-	start time.Time
+	name     string
+	start    time.Time
+	recorder *perfRecorder
 }
 
-func startTimer(name string) *perfTimer {
-	return &perfTimer{name: name, start: time.Now()}
+type perfRecorder struct {
+	runID    string
+	sourceID string
+	newID    string
+	start    time.Time
+	seq      int64
+}
+
+type perfEvent struct {
+	Type       string `json:"type"`
+	RunID      string `json:"run_id"`
+	SourceID   string `json:"source_id,omitempty"`
+	NewID      string `json:"new_id,omitempty"`
+	Step       string `json:"step,omitempty"`
+	Checkpoint string `json:"checkpoint,omitempty"`
+	Status     string `json:"status,omitempty"`
+	Error      string `json:"error,omitempty"`
+	Seq        int64  `json:"seq"`
+	TsUnixNs   int64  `json:"ts_unix_ns"`
+	OffsetNs   int64  `json:"offset_ns"`
+	DurationNs int64  `json:"duration_ns,omitempty"`
+}
+
+func newPerfRecorder(sourceID, newID string) *perfRecorder {
+	start := time.Now()
+	r := &perfRecorder{
+		runID:    fmt.Sprintf("%s->%s-%d", sourceID, newID, start.UnixNano()),
+		sourceID: sourceID,
+		newID:    newID,
+		start:    start,
+	}
+	r.emit(perfEvent{
+		Type:     "flow_start",
+		Status:   "started",
+		TsUnixNs: start.UnixNano(),
+		OffsetNs: 0,
+	})
+	return r
+}
+
+func (r *perfRecorder) emit(ev perfEvent) {
+	if r == nil {
+		return
+	}
+	r.seq++
+	ev.RunID = r.runID
+	ev.SourceID = r.sourceID
+	ev.NewID = r.newID
+	ev.Seq = r.seq
+	if ev.TsUnixNs == 0 {
+		ev.TsUnixNs = time.Now().UnixNano()
+	}
+	if ev.OffsetNs == 0 && ev.TsUnixNs > r.start.UnixNano() {
+		ev.OffsetNs = ev.TsUnixNs - r.start.UnixNano()
+	}
+	payload, err := json.Marshal(ev)
+	if err != nil {
+		logrus.Errorf("superfork perf: failed to marshal event: %v", err)
+		return
+	}
+	logrus.Infof("[PERFJSON] %s", payload)
+}
+
+func (r *perfRecorder) beginStep(name string, t time.Time) {
+	r.emit(perfEvent{
+		Type:     "step_start",
+		Step:     name,
+		TsUnixNs: t.UnixNano(),
+		OffsetNs: t.Sub(r.start).Nanoseconds(),
+	})
+}
+
+func (r *perfRecorder) endStep(name string, start, end time.Time) {
+	r.emit(perfEvent{
+		Type:       "step_end",
+		Step:       name,
+		TsUnixNs:   end.UnixNano(),
+		OffsetNs:   end.Sub(r.start).Nanoseconds(),
+		DurationNs: end.Sub(start).Nanoseconds(),
+	})
+}
+
+func (r *perfRecorder) checkpoint(name string) {
+	now := time.Now()
+	r.emit(perfEvent{
+		Type:       "checkpoint",
+		Checkpoint: name,
+		TsUnixNs:   now.UnixNano(),
+		OffsetNs:   now.Sub(r.start).Nanoseconds(),
+	})
+}
+
+func (r *perfRecorder) finish(err error) {
+	now := time.Now()
+	status := "ok"
+	errMsg := ""
+	if err != nil {
+		status = "error"
+		errMsg = err.Error()
+	}
+	r.emit(perfEvent{
+		Type:       "flow_end",
+		Status:     status,
+		Error:      errMsg,
+		TsUnixNs:   now.UnixNano(),
+		OffsetNs:   now.Sub(r.start).Nanoseconds(),
+		DurationNs: now.Sub(r.start).Nanoseconds(),
+	})
+}
+
+func startTimer(name string, recorder *perfRecorder) *perfTimer {
+	start := time.Now()
+	if recorder != nil {
+		recorder.beginStep(name, start)
+	}
+	return &perfTimer{name: name, start: start, recorder: recorder}
 }
 
 func (t *perfTimer) Stop() {
-	elapsed := time.Since(t.start)
+	end := time.Now()
+	elapsed := end.Sub(t.start)
 	logrus.Infof("[PERF] %s: %v", t.name, elapsed)
+	if t.recorder != nil {
+		t.recorder.endStep(t.name, t.start, end)
+	}
 }
 
 func (t *perfTimer) Checkpoint(stage string) {
 	elapsed := time.Since(t.start)
 	logrus.Infof("[PERF] %s.%s: %v", t.name, stage, elapsed)
+	if t.recorder != nil {
+		t.recorder.checkpoint(stage)
+	}
 }
 
 // ========== End Performance Tracking ==========
@@ -152,18 +274,23 @@ func cgroupPathForKernel(absolutePath string) string {
 	return absolutePath
 }
 
-func doSuperFork(context *cli.Context) error {
-	timer := startTimer("total")
-	defer timer.Stop()
-
+func doSuperFork(context *cli.Context) (retErr error) {
 	sourceID := context.Args().Get(0)
 	newID := context.Args().Get(1)
+	recorder := newPerfRecorder(sourceID, newID)
+	defer func() {
+		recorder.finish(retErr)
+	}()
+
+	timer := startTimer("total", recorder)
+	defer timer.Stop()
+
 	root := context.GlobalString("root")
 	if root == "" {
 		return errors.New("root not set")
 	}
 
-	t1 := startTimer("load_source")
+	t1 := startTimer("load_source", recorder)
 	sourceContainer, err := libcontainer.Load(root, sourceID)
 	if err != nil {
 		return fmt.Errorf("failed to load source container: %w", err)
@@ -200,7 +327,7 @@ func doSuperFork(context *cli.Context) error {
 	logrus.Infof("superfork: source rootfs: %s", srcRootfs)
 	logrus.Infof("superfork: new rootfs: %s", dstRootfs)
 
-	tSnapshot := startTimer("create_snapshot")
+	tSnapshot := startTimer("create_snapshot", recorder)
 	if err := createBtrfsSnapshot(srcBundle, bundle); err != nil {
 		return fmt.Errorf("failed to create snapshot: %w", err)
 	}
@@ -208,7 +335,7 @@ func doSuperFork(context *cli.Context) error {
 	timer.Checkpoint("snapshot_created")
 
 	// Freeze source
-	t2 := startTimer("freeze_source")
+	t2 := startTimer("freeze_source", recorder)
 	if err := sourceContainer.Pause(); err != nil {
 		return fmt.Errorf("failed to freeze source: %w", err)
 	}
@@ -220,7 +347,7 @@ func doSuperFork(context *cli.Context) error {
 		if sourceThawed {
 			return
 		}
-		t := startTimer("thaw_source")
+		t := startTimer("thaw_source", recorder)
 		defer t.Stop()
 
 		logrus.Info("superfork: thawing source container")
@@ -243,7 +370,9 @@ func doSuperFork(context *cli.Context) error {
 	defer thawSource()
 
 	// Get source PIDs
+	tGetPIDs := startTimer("get_source_pids", recorder)
 	pids, err := sourceContainer.Processes()
+	tGetPIDs.Stop()
 	if err != nil {
 		return err
 	}
@@ -253,7 +382,7 @@ func doSuperFork(context *cli.Context) error {
 	timer.Checkpoint("got_pids")
 
 	// Prepare new container spec
-	t3 := startTimer("prepare_new_container")
+	t3 := startTimer("prepare_new_container", recorder)
 	_, spec, err := prepareNewContainer(context, sourceID, newID, bundle)
 	if err != nil {
 		return err
@@ -261,7 +390,7 @@ func doSuperFork(context *cli.Context) error {
 	t3.Stop()
 
 	// Create new container
-	t4 := startTimer("create_container")
+	t4 := startTimer("create_container", recorder)
 	origDir, err := os.Getwd()
 	if err != nil {
 		return fmt.Errorf("getwd before create: %w", err)
@@ -279,7 +408,7 @@ func doSuperFork(context *cli.Context) error {
 	t4.Stop()
 
 	// Apply cgroup setup
-	t5 := startTimer("apply_cgroup")
+	t5 := startTimer("apply_cgroup", recorder)
 	if err := newContainer.Apply(-1); err != nil {
 		newContainer.Destroy()
 		return err
@@ -288,13 +417,16 @@ func doSuperFork(context *cli.Context) error {
 	timer.Checkpoint("cgroup_applied")
 
 	// Get cgroup path
+	tResolveCgroup := startTimer("resolve_cgroup_path", recorder)
 	cgroupPath, err := getContainerCgroupPath(newContainer)
 	if err != nil {
+		tResolveCgroup.Stop()
 		newContainer.Destroy()
 		return fmt.Errorf("failed to get new container cgroup path: %w", err)
 	}
 
 	if _, err := os.Stat(cgroupPath); err != nil {
+		tResolveCgroup.Stop()
 		newContainer.Destroy()
 		return fmt.Errorf("new container cgroup doesn't exist at %s: %w", cgroupPath, err)
 	}
@@ -302,15 +434,17 @@ func doSuperFork(context *cli.Context) error {
 	kernelCgroupPath := cgroupPathForKernel(cgroupPath)
 
 	if kernelCgroupPath == "" || kernelCgroupPath == "/" {
+		tResolveCgroup.Stop()
 		newContainer.Destroy()
 		return fmt.Errorf("invalid kernel cgroup path: %s", kernelCgroupPath)
 	}
+	tResolveCgroup.Stop()
 
 	logrus.Infof("superfork: using cgroup path: %s (kernel: %s)", cgroupPath, kernelCgroupPath)
 	logrus.Infof("superfork: new rootfs path: %s", dstRootfs)
 
 	// Call superfork syscall with new rootfs path
-	t6 := startTimer("superfork_syscall")
+	t6 := startTimer("superfork_syscall", recorder)
 	newInitPID, err := superforkSyscall(pids, newID, kernelCgroupPath, dstRootfs)
 	t6.Stop()
 	timer.Checkpoint("syscall_done")
@@ -323,16 +457,18 @@ func doSuperFork(context *cli.Context) error {
 	logrus.Infof("superfork: new init PID: %d", newInitPID)
 
 	// Update state
-	t7 := startTimer("update_state")
+	t7 := startTimer("update_state", recorder)
 	if err := updateContainerState(context, newContainer, int(newInitPID), root, newID); err != nil {
 		logrus.Errorf("failed to update container state: %v", err)
 	}
 	t7.Stop()
 
 	if pidFile := context.String("pid-file"); pidFile != "" {
+		tPidFile := startTimer("write_pid_file", recorder)
 		if err := superforkCreatePidFile(pidFile, int(newInitPID)); err != nil {
 			logrus.Errorf("failed to write pid file: %v", err)
 		}
+		tPidFile.Stop()
 	}
 
 	thawSource()
