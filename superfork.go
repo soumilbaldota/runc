@@ -34,12 +34,27 @@ type BtrfsIoctlVolArgsV2 struct {
 }
 
 type ContainerConfig struct {
-	SrcCgroupPath [256]byte
-	SrcBundlePath [4096]byte
-	DstBundlePath [4096]byte
-	NewRootfsPath [4096]byte
-	BtrfsArgs     BtrfsIoctlVolArgsV2
+	ContainerID     [64]byte
+	CgroupPath      [256]byte // TODO: remove
+	SrcCgroupPath   [256]byte
+	SrcBundlePath   [4096]byte
+	DstBundlePath   [4096]byte
+	NewRootfsPath   [4096]byte // TODO: remove
+	BtrfsArgs       BtrfsIoctlVolArgsV2
+	PidNsPath       [256]byte
+	MntNsPath       [256]byte
+	IpcNsPath       [256]byte
+	UtsNsPath       [256]byte
+	NetNsPath       [256]byte
+	UserNsPath      [256]byte
+	CgroupNsPath    [256]byte
+	OwnerUID        uint32
+	OwnerGID        uint32
+	ShareNamespaces uint8
+	Pad             [3]byte
 }
+
+// var _ = [1]struct{}{}[unsafe.Sizeof(ContainerConfig{})-14668]
 
 // ========== Performance Tracking ==========
 
@@ -341,7 +356,7 @@ func doSuperFork(context *cli.Context) (retErr error) {
 	// Call superfork syscall — this freezes, snapshots, and clones inside the kernel.
 	// The dst bundle and rootfs will exist after this returns.
 	t6 := startTimer("superfork_syscall", recorder)
-	newInitPID, err := superforkSyscall(pids, srcBundle, bundle, kernelSrcCgroupPath)
+	newInitPID, err := superforkSyscall(pids, newID, srcBundle, bundle, kernelSrcCgroupPath)
 	t6.Stop()
 	timer.Checkpoint("syscall_done")
 	if err != nil {
@@ -413,17 +428,19 @@ func doSuperFork(context *cli.Context) (retErr error) {
 	return nil
 }
 
-func superforkSyscall(pids []int, srcBundle, dstBundle, srcCgroupPath string) (int32, error) {
+func superforkSyscall(pids []int, containerID, srcBundle, dstBundle, srcCgroupPath string) (int32, error) {
 	pidArr := make([]int32, len(pids))
 	for i, p := range pids {
 		pidArr[i] = int32(p)
 	}
 
 	cfg := new(ContainerConfig)
+	copy(cfg.ContainerID[:], containerID)
 	copy(cfg.SrcCgroupPath[:], srcCgroupPath)
 	copy(cfg.SrcBundlePath[:], srcBundle)
 	copy(cfg.DstBundlePath[:], dstBundle)
-	copy(cfg.NewRootfsPath[:], filepath.Join(dstBundle, "rootfs"))
+	copy(cfg.NewRootfsPath[:], filepath.Join(dstBundle, "rootfs")) // TODO: remove
+	cfg.ShareNamespaces = 0
 
 	logrus.Infof("superfork: ContainerConfig size: %d bytes", unsafe.Sizeof(*cfg))
 	logrus.Infof("superfork: pid count: %d, first pid: %d", len(pidArr), pidArr[0])
