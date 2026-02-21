@@ -219,6 +219,16 @@ EXAMPLE:
 			Usage: `path to the root of the bundle directory for the new container`,
 		},
 		cli.StringFlag{
+			Name:  "src_bundle",
+			Value: "",
+			Usage: "path to the source bundle directory (overrides auto-detection from container rootfs)",
+		},
+		cli.StringFlag{
+			Name:  "dest_bundle",
+			Value: "",
+			Usage: "path to the destination bundle directory for the new container",
+		},
+		cli.StringFlag{
 			Name:  "pid-file",
 			Value: "",
 			Usage: "specify the file to write the new container's init process id to",
@@ -312,14 +322,20 @@ func doSuperFork(context *cli.Context) (retErr error) {
 		return fmt.Errorf("source container must be running (current: %v)", status)
 	}
 
-	sourceConfig := sourceContainer.Config()
-	srcRootfs := sourceConfig.Rootfs
-	if srcRootfs == "" {
-		return fmt.Errorf("source container has no rootfs")
+	srcBundle := strings.TrimSpace(context.String("src_bundle"))
+	if srcBundle == "" {
+		sourceConfig := sourceContainer.Config()
+		srcRootfs := sourceConfig.Rootfs
+		if srcRootfs == "" {
+			return fmt.Errorf("source container has no rootfs")
+		}
+		srcBundle = filepath.Dir(srcRootfs)
 	}
-	srcBundle := filepath.Dir(srcRootfs)
 
-	bundle := context.String("bundle")
+	bundle := strings.TrimSpace(context.String("dest_bundle"))
+	if bundle == "" {
+		bundle = context.String("bundle")
+	}
 	if bundle == "" {
 		bundleParent := filepath.Dir(srcBundle)
 		bundle = filepath.Join(bundleParent, filepath.Base(srcBundle)+"-"+newID)
