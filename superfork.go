@@ -23,6 +23,7 @@ import (
 
 const (
 	SYS_SUPERFORK = 470
+	maxHandoffFDs = 64
 )
 
 type BtrfsIoctlVolArgsV2 struct {
@@ -30,7 +31,9 @@ type BtrfsIoctlVolArgsV2 struct {
 	Transid uint64
 	Flags   uint64
 	Unused  [4]uint64
-	Name    [256]byte
+	// Matches struct btrfs_ioctl_vol_args_v2 name union size:
+	// BTRFS_SUBVOL_NAME_MAX + 1 == 4040 bytes.
+	Name [4040]byte
 }
 
 type ContainerConfig struct {
@@ -51,10 +54,11 @@ type ContainerConfig struct {
 	OwnerUID        uint32
 	OwnerGID        uint32
 	ShareNamespaces uint8
-	Pad             [3]byte
+	HandOffFds      [64]int32
+	HandOffFdCount  int32
 }
 
-// var _ = [1]struct{}{}[unsafe.Sizeof(ContainerConfig{})-14668]
+// var _ = [1]struct{}{}[unsafe.Sizeof(ContainerConfig{})-19024]
 
 // ========== Performance Tracking ==========
 
@@ -233,6 +237,11 @@ EXAMPLE:
 			Value: "",
 			Usage: "specify the file to write the new container's init process id to",
 		},
+		cli.StringFlag{
+			Name:  "handoff-fds",
+			Value: "",
+			Usage: "comma-separated source-container fd numbers to preserve and handoff to the clone",
+		},
 		cli.BoolFlag{
 			Name:  "detach, d",
 			Usage: "detach from the container's process",
@@ -294,6 +303,15 @@ func cgroupPathForKernel(absolutePath string) string {
 func doSuperFork(context *cli.Context) (retErr error) {
 	sourceID := context.Args().Get(0)
 	newID := context.Args().Get(1)
+	rawHandoffFDs := context.String("handoff-fds")
+	if rawHandoffFDs == "" {
+		rawHandoffFDs = os.Getenv("SUPERFORK_HANDOFF_FDS")
+	}
+	handoffFDs, err := parseHandoffFDList(rawHandoffFDs)
+	if err != nil {
+		return fmt.Errorf("invalid handoff fds: %w", err)
+	}
+
 	recorder := newPerfRecorder(sourceID, newID)
 	defer func() {
 		recorder.finish(retErr)
@@ -371,8 +389,12 @@ func doSuperFork(context *cli.Context) (retErr error) {
 
 	// Call superfork syscall — this freezes, snapshots, and clones inside the kernel.
 	// The dst bundle and rootfs will exist after this returns.
+	if len(handoffFDs) > 0 {
+		logrus.Infof("superfork: requested handoff fds: %v", handoffFDs)
+	}
+
 	t6 := startTimer("superfork_syscall", recorder)
-	newInitPID, err := superforkSyscall(pids, newID, srcBundle, bundle, kernelSrcCgroupPath)
+	newInitPID, err := superforkSyscall(pids, newID, srcBundle, bundle, kernelSrcCgroupPath, handoffFDs)
 	t6.Stop()
 	timer.Checkpoint("syscall_done")
 	if err != nil {
@@ -444,7 +466,44 @@ func doSuperFork(context *cli.Context) (retErr error) {
 	return nil
 }
 
-func superforkSyscall(pids []int, containerID, srcBundle, dstBundle, srcCgroupPath string) (int32, error) {
+func parseHandoffFDList(raw string) ([]int, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+
+	parts := strings.Split(raw, ",")
+	fds := make([]int, 0, len(parts))
+	seen := make(map[int]struct{}, len(parts))
+
+	for _, part := range parts {
+		fdText := strings.TrimSpace(part)
+		if fdText == "" {
+			return nil, fmt.Errorf("empty fd in list %q", raw)
+		}
+
+		fd, err := strconv.Atoi(fdText)
+		if err != nil {
+			return nil, fmt.Errorf("invalid fd %q: %w", fdText, err)
+		}
+		if fd < 0 {
+			return nil, fmt.Errorf("fd must be non-negative: %d", fd)
+		}
+		if _, exists := seen[fd]; exists {
+			continue
+		}
+
+		seen[fd] = struct{}{}
+		fds = append(fds, fd)
+		if len(fds) > maxHandoffFDs {
+			return nil, fmt.Errorf("too many handoff fds: %d (max %d)", len(fds), maxHandoffFDs)
+		}
+	}
+
+	return fds, nil
+}
+
+func superforkSyscall(pids []int, containerID, srcBundle, dstBundle, srcCgroupPath string, handoffFDs []int) (int32, error) {
 	pidArr := make([]int32, len(pids))
 	for i, p := range pids {
 		pidArr[i] = int32(p)
@@ -457,9 +516,17 @@ func superforkSyscall(pids []int, containerID, srcBundle, dstBundle, srcCgroupPa
 	copy(cfg.DstBundlePath[:], dstBundle)
 	copy(cfg.NewRootfsPath[:], filepath.Join(dstBundle, "rootfs")) // TODO: remove
 	cfg.ShareNamespaces = 0
+	if len(handoffFDs) > maxHandoffFDs {
+		return 0, fmt.Errorf("too many handoff fds: %d (max %d)", len(handoffFDs), maxHandoffFDs)
+	}
+	for i, fd := range handoffFDs {
+		cfg.HandOffFds[i] = int32(fd)
+	}
+	cfg.HandOffFdCount = int32(len(handoffFDs))
 
 	logrus.Infof("superfork: ContainerConfig size: %d bytes", unsafe.Sizeof(*cfg))
 	logrus.Infof("superfork: pid count: %d, first pid: %d", len(pidArr), pidArr[0])
+	logrus.Infof("superfork: handoff fd count: %d", cfg.HandOffFdCount)
 
 	newInitPID := new(int32) // heap-allocated, won't move
 
