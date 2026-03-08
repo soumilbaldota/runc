@@ -444,8 +444,12 @@ func doSuperFork(context *cli.Context) (retErr error) {
 	t7.Stop()
 
 	if pidFile := context.String("pid-file"); pidFile != "" {
+		tPidFile := startTimer("write_pid_file", recorder)
 		if err := superforkCreatePidFile(pidFile, int(newInitPID)); err != nil {
+			tPidFile.Stop()
 			logrus.Errorf("failed to write pid file: %v", err)
+		} else {
+			tPidFile.Stop()
 		}
 	}
 
